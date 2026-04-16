@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RustDesk — Client Status</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+           background: #0f172a; color: #e2e8f0; min-height: 100vh; padding: 2rem; }
+    h1 { font-size: 1.5rem; font-weight: 600; margin-bottom: 0.25rem; }
+    .subtitle { color: #94a3b8; font-size: 0.875rem; margin-bottom: 2rem; }
+    .stats { display: flex; gap: 1rem; margin-bottom: 2rem; flex-wrap: wrap; }
+    .stat { background: #1e293b; border-radius: 0.75rem; padding: 1rem 1.5rem; min-width: 120px; }
+    .stat-value { font-size: 2rem; font-weight: 700; }
+    .stat-label { font-size: 0.75rem; color: #94a3b8; margin-top: 0.25rem; }
+    .online  { color: #4ade80; }
+    .offline { color: #f87171; }
+    .total   { color: #60a5fa; }
+    .search-bar { margin-bottom: 1rem; }
+    .search-bar input {
+      width: 100%; padding: 0.6rem 1rem; border-radius: 0.5rem;
+      background: #1e293b; border: 1px solid #334155; color: #e2e8f0;
+      font-size: 0.875rem; outline: none;
+    }
+    .search-bar input:focus { border-color: #60a5fa; }
+    table { width: 100%; border-collapse: collapse; background: #1e293b;
+            border-radius: 0.75rem; overflow: hidden; }
+    th { background: #0f172a; padding: 0.75rem 1rem; text-align: left;
+         font-size: 0.75rem; text-transform: uppercase; color: #94a3b8;
+         letter-spacing: 0.05em; cursor: pointer; user-select: none; }
+    th:hover { color: #e2e8f0; }
+    td { padding: 0.75rem 1rem; border-top: 1px solid #0f172a; font-size: 0.875rem; }
+    tr:hover td { background: #243044; }
+    .badge { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 9999px;
+             font-size: 0.7rem; font-weight: 600; }
+    .badge-online  { background: #14532d; color: #4ade80; }
+    .badge-offline { background: #1f1f1f; color: #94a3b8; }
+    .firma-cell { font-weight: 500; color: #93c5fd; }
+    .pcname-cell { color: #e2e8f0; }
+    .unknown { color: #475569; font-style: italic; }
+    .notiz-icon { cursor: help; margin-left: 0.3rem; color: #60a5fa; font-size: 0.75rem; }
+    .pw-cell { font-family: monospace; font-size: 0.8rem; color: #fbbf24;
+               cursor: pointer; user-select: all; }
+    .refresh-info { color: #475569; font-size: 0.75rem; margin-top: 1rem; text-align: right; }
+  </style>
+</head>
+<body>
+  <h1>RustDesk — Client Status</h1>
+  <p class="subtitle">Server: 192.168.0.238 &nbsp;|&nbsp; <span id="last-update">Wird geladen…</span></p>
+  <div class="stats">
+    <div class="stat"><div class="stat-value total"   id="s-total">—</div><div class="stat-label">Gesamt</div></div>
+    <div class="stat"><div class="stat-value online"  id="s-online">—</div><div class="stat-label">Online</div></div>
+    <div class="stat"><div class="stat-value offline" id="s-offline">—</div><div class="stat-label">Offline</div></div>
+  </div>
+  <div class="search-bar">
+    <input type="text" id="search" placeholder="Suche nach Firma, PC-Name, ID …" oninput="render()">
+  </div>
+  <table>
+    <thead><tr>
+      <th>Firma</th>
+      <th>PC-Name</th>
+      <th>Status</th>
+      <th>Client ID</th>
+      <th>IP-Adresse</th>
+      <th>Zuletzt gesehen</th>
+      <th>Passwort</th>
+    </tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+  <p class="refresh-info">Aktualisiert automatisch alle 30 Sekunden</p>
+
+  <script>
+    const THRESHOLD = 30;
+    let ALL_DATA = [];
+
+    const fmt = ts => ts ? new Date(ts*1000).toLocaleString('de-DE',
+      {day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '—';
+    const ago = ts => {
+      const s = Math.floor(Date.now()/1000) - ts;
+      if (s < 60) return s+'s';
+      if (s < 3600) return Math.floor(s/60)+'m';
+      if (s < 86400) return Math.floor(s/3600)+'h';
+      return Math.floor(s/86400)+'d';
+    };
+    const esc = s => s ? s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') : '';
+
+    function render() {
+      const q = document.getElementById('search').value.toLowerCase();
+      const now = Math.floor(Date.now()/1000);
+      let online = 0;
+
+      const filtered = ALL_DATA.filter(c =>
+        !q ||
+        (c.firma   || '').toLowerCase().includes(q) ||
+        (c.pc_name || '').toLowerCase().includes(q) ||
+        (c.peer_id || '').toLowerCase().includes(q) ||
+        (c.last_ip || '').toLowerCase().includes(q)
+      );
+
+      const rows = filtered.map(c => {
+        const on = (now - c.last_seen) < THRESHOLD;
+        if (on) online++;
+        const firma   = c.firma   ? `<span class="firma-cell">${esc(c.firma)}</span>`
+                                  : `<span class="unknown">—</span>`;
+        const pcname  = c.pc_name ? `<span class="pcname-cell">${esc(c.pc_name)}</span>`
+                                  : `<span class="unknown">—</span>`;
+        const notizTip = c.notizen ? ` <span class="notiz-icon" title="${esc(c.notizen)}">💬</span>` : '';
+        const pw      = c.kennwort ? `<span class="pw-cell" title="Klicken zum Kopieren" onclick="navigator.clipboard.writeText('${esc(c.kennwort)}')">${esc(c.kennwort)}</span>`
+                                   : `<span class="unknown">—</span>`;
+        const ip      = (c.last_ip || '').replace('::ffff:','');
+        return `<tr>
+          <td>${firma}${notizTip}</td>
+          <td>${pcname}</td>
+          <td><span class="badge ${on?'badge-online':'badge-offline'}">${on?'ONLINE':'OFFLINE'}</span></td>
+          <td><code>${esc(c.peer_id)}</code></td>
+          <td>${ip||'—'}</td>
+          <td title="${fmt(c.last_seen)}">${ago(c.last_seen)} ago</td>
+          <td>${pw}</td>
+        </tr>`;
+      }).join('');
+
+      document.getElementById('tbody').innerHTML = rows ||
+        '<tr><td colspan="7" style="text-align:center;color:#475569;padding:2rem">Keine Einträge</td></tr>';
+      document.getElementById('s-total').textContent  = ALL_DATA.length;
+      document.getElementById('s-online').textContent  = online;
+      document.getElementById('s-offline').textContent = ALL_DATA.length - online;
+    }
+
+    async function load() {
+      try {
+        ALL_DATA = await fetch('/api/clients').then(r => r.json());
+        render();
+        document.getElementById('last-update').textContent =
+          'Aktualisiert: ' + new Date().toLocaleTimeString('de-DE');
+      } catch(e) {
+        document.getElementById('tbody').innerHTML =
+          '<tr><td colspan="7" style="color:#f87171;padding:1rem">Fehler beim Laden</td></tr>';
+      }
+    }
+
+    load();
+    setInterval(load, 30000);
+  </script>
+</body>
+</html>

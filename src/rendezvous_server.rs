@@ -41,9 +41,10 @@ use std::{
 };
 
 // Imports für die neue API
+use crate::client_status_store::ClientStatusStore;
 use axum::{
     routing::get,
-    response::Json,
+    response::{IntoResponse, Json},
     Router,
     Extension,
 };
@@ -91,6 +92,7 @@ pub struct RendezvousServer {
     relay_servers0: Arc<RelayServers>,
     rendezvous_servers: Arc<RwLock<Vec<String>>>,
     inner: Arc<RwLock<Inner>>,
+    client_status_store: Option<ClientStatusStore>,
 }
 
 enum LoopFailure {
@@ -132,6 +134,78 @@ async fn get_online_peers_handler(
     }
     Json(online_peers)
 }
+async fn get_clients_handler(
+    Extension(state): Extension<Arc<RendezvousServer>>,
+) -> impl axum::response::IntoResponse {
+    use axum::http::StatusCode;
+    match &state.client_status_store {
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "store not available"})),
+        )
+            .into_response(),
+        Some(store) => match store.get_all_clients().await {
+            Ok(clients) => Json(clients).into_response(),
+            Err(e) => {
+                log::error!("get_clients_handler: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "database error"})),
+                )
+                    .into_response()
+            }
+        },
+    }
+}
+
+async fn get_client_status_handler(
+    axum::extract::Path(peer_id): axum::extract::Path<String>,
+    Extension(state): Extension<Arc<RendezvousServer>>,
+) -> impl axum::response::IntoResponse {
+    use axum::http::StatusCode;
+    match &state.client_status_store {
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "store not available"})),
+        )
+            .into_response(),
+        Some(store) => match store.get_client(&peer_id).await {
+            Ok(Some(c)) => {
+                let online = (chrono::Utc::now().timestamp() - c.last_seen) < 30;
+                Json(serde_json::json!({
+                    "peer_id": c.peer_id,
+                    "online": online,
+                    "last_seen": c.last_seen,
+                    "last_ip": c.last_ip,
+                    "created_at": c.created_at,
+                    "firma": c.firma,
+                    "pc_name": c.pc_name,
+                    "notizen": c.notizen,
+                    "kennwort": c.kennwort
+                }))
+                .into_response()
+            }
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "not found", "peer_id": peer_id})),
+            )
+                .into_response(),
+            Err(e) => {
+                log::error!("get_client_status_handler {}: {:?}", peer_id, e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "database error"})),
+                )
+                    .into_response()
+            }
+        },
+    }
+}
+
+async fn get_dashboard_handler() -> impl axum::response::IntoResponse {
+    axum::response::Html(include_str!("dashboard.html"))
+}
+
 // --- ENDE NEUER CODE FÜR API ---
 
 impl RendezvousServer {
@@ -166,6 +240,17 @@ impl RendezvousServer {
                     .unwrap_or_default(),
             )
         };
+        let client_status_store = match ClientStatusStore::new("client_status.sqlite3").await {
+            Ok(store) => {
+                log::info!("Client status store ready");
+                Some(store)
+            }
+            Err(e) => {
+                log::error!("Failed to init client status store: {:?}", e);
+                log::warn!("Client status tracking disabled");
+                None
+            }
+        };
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
             pm,
@@ -181,6 +266,7 @@ impl RendezvousServer {
                 mask,
                 local_ip,
             })),
+            client_status_store,
         };
         rs.parse_relay_servers(&get_arg("relay-servers"));
         let server_state = Arc::new(rs);
@@ -229,7 +315,10 @@ impl RendezvousServer {
         };
 
         let app = Router::new()
+            .route("/", get(get_dashboard_handler))
             .route("/api/online_peers", get(get_online_peers_handler))
+            .route("/api/clients", get(get_clients_handler))
+            .route("/api/client/:peer_id", get(get_client_status_handler))
             .layer(ServiceBuilder::new().layer(Extension(server_state.clone())));
 
         let addr = SocketAddr::from(([0, 0, 0, 0], api_port));
@@ -474,8 +563,20 @@ impl RendezvousServer {
                             );
                         }
                     }
+                    let peer_id_for_hook = id.clone();
                     if changed {
                         self.pm.update_pk(id, peer.clone(), addr, rk.uuid, rk.pk, ip).await;
+                    }
+                    // === CLIENT STATUS HOOK 2: RegisterPk (Erst-Registrierung / PK-Update) ===
+                    if let Some(store) = self.client_status_store.clone() {
+                        let peer_id_owned = peer_id_for_hook;
+                        let ip_string = addr.ip().to_string();
+                        let now_ts = chrono::Utc::now().timestamp();
+                        tokio::spawn(async move {
+                            if let Err(e) = store.upsert_client_seen(&peer_id_owned, Some(&ip_string), now_ts).await {
+                                log::error!("client status upsert failed (register_pk) for {}: {:?}", peer_id_owned, e);
+                            }
+                        });
                     }
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_register_pk_response(RegisterPkResponse {
@@ -665,6 +766,17 @@ impl RendezvousServer {
         };
         if let Some(old_log) = ip_change {
             log::info!("IP change of {} from {} to {}", id, old_log, socket_addr);
+        }
+        // === CLIENT STATUS HOOK 1: RegisterPeer ===
+        if let Some(store) = self.client_status_store.clone() {
+            let peer_id_owned = id.to_owned();
+            let ip_string = socket_addr.ip().to_string();
+            let now_ts = chrono::Utc::now().timestamp();
+            tokio::spawn(async move {
+                if let Err(e) = store.upsert_client_seen(&peer_id_owned, Some(&ip_string), now_ts).await {
+                    log::error!("client status upsert failed (update_addr) for {}: {:?}", peer_id_owned, e);
+                }
+            });
         }
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_register_peer_response(RegisterPeerResponse {
